@@ -7,32 +7,38 @@ import os
 import os.path as osp
 import re
 import webbrowser
-
 import imgviz
 import natsort
 from qtpy import QtCore
 from qtpy.QtCore import Qt
 from qtpy import QtGui
 from qtpy import QtWidgets
+from qtpy.QtGui import QMovie
 
-from labelme import __appname__
-from labelme import PY2
+from __init__ import __appname__
+from __init__ import PY2
 
-from . import utils
-from labelme.config import get_config
-from labelme.label_file import LabelFile
-from labelme.label_file import LabelFileError
-from labelme.logger import logger
-from labelme.shape import Shape
-from labelme.widgets import BrightnessContrastDialog
-from labelme.widgets import Canvas
-from labelme.widgets import FileDialogPreview
-from labelme.widgets import LabelDialog
-from labelme.widgets import LabelListWidget
-from labelme.widgets import LabelListWidgetItem
-from labelme.widgets import ToolBar
-from labelme.widgets import UniqueLabelQListWidget
-from labelme.widgets import ZoomWidget
+import utils
+from config import get_config
+from label_file import LabelFile
+from label_file import LabelFileError
+from logger import logger
+from shape import Shape
+from widgets import BrightnessContrastDialog
+from widgets import Canvas
+from widgets import FileDialogPreview
+from widgets import LabelDialog
+from widgets import LabelListWidget
+from widgets import LabelListWidgetItem
+from widgets import ToolBar
+from widgets import UniqueLabelQListWidget
+from widgets import ZoomWidget
+from widgets import LoadingThread, LoadingTranslucentScreen
+
+from caranet.inference import infer
+from caranet.patching import create_patches
+from yolov5.detect import iel_detection
+from yolov5.LabelConverter import get_json_from_labels
 
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
@@ -61,8 +67,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "argument output is deprecated, use output_file instead"
             )
             if output_file is None:
-                output_file = output
-
+                output_file = output      
+  
         # see labelme/config/default_config.yaml for valid configuration
         if config is None:
             config = get_config()
@@ -90,6 +96,9 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
 
+         # Add default loading animation for AI Actions
+        self.loadingTranslucentScreen = LoadingTranslucentScreen(parent=self,
+                                                           description_text='Waiting...', dot_animation=False)
         # Whether we need to save or not.
         self.dirty = False
 
@@ -249,6 +258,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Open prev (hold Ctl+Shift to copy labels)"),
             enabled=False,
         )
+        ######### Adding Segmentation And IELs Counting Button to app ###########
+        segmentMode = action(
+            self.tr("&Segment Image"),
+            self.segmentMode,
+            shortcut = shortcuts["seg_img"],
+            icon = "segment",
+            tip = self.tr("Click to Segment the opened Image"),
+            enabled=False,
+        )
+        countIEL = action(
+            self.tr("&Count IEL"),
+            self.iel_counting,
+            shortcut = shortcuts["iel_count"],
+            icon = "count_iels",
+            tip = self.tr("Click to Count IELs"),
+            enabled=False,
+        )
+        #######################################################
         save = action(
             self.tr("&Save"),
             self.saveFile,
@@ -585,6 +612,8 @@ class MainWindow(QtWidgets.QMainWindow):
             save=save,
             saveAs=saveAs,
             open=open_,
+            segmentMode=segmentMode,
+            countIEL = countIEL,
             close=close,
             deleteFile=deleteFile,
             toggleKeepPrevMode=toggle_keep_prev_mode,
@@ -615,6 +644,7 @@ class MainWindow(QtWidgets.QMainWindow):
             openNextImg=openNextImg,
             openPrevImg=openPrevImg,
             fileMenuActions=(open_, opendir, save, saveAs, close, quit),
+            aiActions = (segmentMode, countIEL),
             tool=(),
             # XXX: need to add some actions here to activate the shortcut
             editMenu=(
@@ -657,6 +687,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 createLineStripMode,
                 editMode,
                 brightnessContrast,
+                segmentMode,
+                countIEL,
             ),
             onShapesPresent=(saveAs, hideAll, showAll),
         )
@@ -668,6 +700,7 @@ class MainWindow(QtWidgets.QMainWindow):
             edit=self.menu(self.tr("&Edit")),
             view=self.menu(self.tr("&View")),
             help=self.menu(self.tr("&Help")),
+            aiActions = self.menu(self.tr("&AI Actions")),  ### Adding AI Actions Menu
             recentFiles=QtWidgets.QMenu(self.tr("Open &Recent")),
             labelList=labelMenu,
         )
@@ -717,6 +750,16 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
 
+        ## Adding actions to menu ##
+        utils.addActions(
+            self.menus.aiActions,
+            (
+                segmentMode,
+                countIEL,
+            ),
+        )
+        ############################
+
         self.menus.file.aboutToShow.connect(self.updateFileMenu)
 
         # Custom context menu for the canvas widget:
@@ -739,6 +782,11 @@ class MainWindow(QtWidgets.QMainWindow):
             save,
             deleteFile,
             None,
+            ###################################################
+            segmentMode,
+            countIEL,
+            None,
+            ###################################################
             createMode,
             editMode,
             duplicate,
@@ -816,6 +864,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # self.firstStart = True
         # if self.firstStart:
         #    QWhatsThis.enterWhatsThisMode()
+
+    def startLoading(self):
+        self.__loadingTranslucentScreen = LoadingTranslucentScreen(parent=self,
+                                                                   description_text='Waiting')
+        self.__loadingTranslucentScreen.setDescriptionLabelDirection('Right')
+        self.__thread = LoadingThread(loading_screen=self.__loadingTranslucentScreen)
+        self.__thread.start()
 
     def menu(self, title, actions=None):
         menu = self.menuBar().addMenu(title)
@@ -1007,6 +1062,141 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise ValueError("Unsupported createMode: %s" % createMode)
         self.actions.editMode.setEnabled(not edit)
 
+    def display(self, filename):
+        self.resetState()
+        self.canvas.setEnabled(False)
+        if filename is None:
+            filename = self.settings.value("filename", "")
+        filename = str(filename)
+        if not QtCore.QFile.exists(filename):
+            self.errorMessage(
+                self.tr("Error opening file"),
+                self.tr("No such file: <b>%s</b>") % filename,
+            )
+            return False
+        # assumes same name, but json extension
+        self.status(
+            str(self.tr("Loading %s...")) % osp.basename(str(filename))
+        )
+        label_file = osp.splitext(filename)[0] + ".json"
+        if self.output_dir:
+            label_file_without_path = osp.basename(label_file)
+            label_file = osp.join(self.output_dir, label_file_without_path)
+        if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
+            label_file
+        ):
+            try:
+                self.labelFile = LabelFile(label_file)
+            except LabelFileError as e:
+                self.errorMessage(
+                    self.tr("Error opening file"),
+                    self.tr(
+                        "<p><b>%s</b></p>"
+                        "<p>Make sure <i>%s</i> is a valid label file."
+                    )
+                    % (e, label_file),
+                )
+                self.status(self.tr("Error reading %s") % label_file)
+                return False
+            self.imageData = self.labelFile.imageData
+            self.imagePath = osp.join(
+                osp.dirname(label_file),
+                self.labelFile.imagePath,
+            )
+            self.otherData = self.labelFile.otherData
+        else:
+            self.imageData = LabelFile.load_image_file(filename)
+            if self.imageData:
+                self.imagePath = filename
+            self.labelFile = None
+        image = QtGui.QImage.fromData(self.imageData)
+
+        if image.isNull():
+            formats = [
+                "*.{}".format(fmt.data().decode())
+                for fmt in QtGui.QImageReader.supportedImageFormats()
+            ]
+            self.errorMessage(
+                self.tr("Error opening file"),
+                self.tr(
+                    "<p>Make sure <i>{0}</i> is a valid image file.<br/>"
+                    "Supported image formats: {1}</p>"
+                ).format(filename, ",".join(formats)),
+            )
+            self.status(self.tr("Error reading %s") % filename)
+            return False
+        self.image = image
+        self.filename = filename
+        if self._config["keep_prev"]:
+            prev_shapes = self.canvas.shapes
+        self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image))
+        flags = {k: False for k in self._config["flags"] or []}
+        if self.labelFile:
+            self.loadLabels(self.labelFile.shapes)
+            if self.labelFile.flags is not None:
+                flags.update(self.labelFile.flags)
+        self.loadFlags(flags)
+        if self._config["keep_prev"] and self.noShapes():
+            self.loadShapes(prev_shapes, replace=False)
+            self.setDirty()
+        else:
+            self.setClean()
+        self.canvas.setEnabled(True)
+        # set zoom values
+        is_initial_load = not self.zoom_values
+        if self.filename in self.zoom_values:
+            self.zoomMode = self.zoom_values[self.filename][0]
+            self.setZoom(self.zoom_values[self.filename][1])
+        elif is_initial_load or not self._config["keep_prev_scale"]:
+            self.adjustScale(initial=True)
+        # set scroll values
+        for orientation in self.scroll_values:
+            if self.filename in self.scroll_values[orientation]:
+                self.setScroll(
+                    orientation, self.scroll_values[orientation][self.filename]
+                )
+        # set brightness contrast values
+        dialog = BrightnessContrastDialog(
+            utils.img_data_to_pil(self.imageData),
+            self.onNewBrightnessContrast,
+            parent=self,
+        )
+        brightness, contrast = self.brightnessContrast_values.get(
+            self.filename, (None, None)
+        )
+        if self._config["keep_prev_brightness"] and self.recentFiles:
+            brightness, _ = self.brightnessContrast_values.get(
+                self.recentFiles[0], (None, None)
+            )
+        if self._config["keep_prev_contrast"] and self.recentFiles:
+            _, contrast = self.brightnessContrast_values.get(
+                self.recentFiles[0], (None, None)
+            )
+        if brightness is not None:
+            dialog.slider_brightness.setValue(brightness)
+        if contrast is not None:
+            dialog.slider_contrast.setValue(contrast)
+        self.brightnessContrast_values[self.filename] = (brightness, contrast)
+        if brightness is not None or contrast is not None:
+            dialog.onNewValue(None)
+        self.paintCanvas()
+        self.addRecentFile(self.filename)
+        self.toggleActions(True)
+        self.canvas.setFocus()
+        self.status(str(self.tr("Loaded %s")) % osp.basename(str(filename)))
+
+    def segmentMode(self):
+        filename = infer(self.openFilename)
+        self.display(filename)
+
+    def iel_counting(self):
+        ipt_img_path = infer(self.openFilename,'img')
+        ipt_img_path, patches_dir = create_patches(ipt_img_path)
+        label_dir = iel_detection(patches_dir)
+        filename = get_json_from_labels(ipt_img_path,label_dir)
+        self.display(filename)
+    
+
     def setEditMode(self):
         self.toggleDrawMode(True)
 
@@ -1025,7 +1215,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 icon, "&%d %s" % (i + 1, QtCore.QFileInfo(f).fileName()), self
             )
             action.triggered.connect(functools.partial(self.loadRecent, f))
-            menu.addAction(action)
+            menu.addAction(action)  
 
     def popLabelListMenu(self, point):
         self.menus.labelList.exec_(self.labelList.mapToGlobal(point))
@@ -1750,6 +1940,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fileDialog.setViewMode(FileDialogPreview.Detail)
         if fileDialog.exec_():
             fileName = fileDialog.selectedFiles()[0]
+            self.openFilename = fileName
             if fileName:
                 self.loadFile(fileName)
 
