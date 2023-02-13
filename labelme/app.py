@@ -119,6 +119,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.labelList = LabelListWidget()
         self.lastOpenDir = None
+        
+        ## Creating a dock for displaying counts and calculations for AI Actions
+        self.stats_list_widget = QtWidgets.QListWidget(self)
+        self.stats_list_widget.setToolTip(
+            self.tr(
+                "Select AI Actions to generate stats "
+            )
+        )
+        self.stats_dock = QtWidgets.QDockWidget(self.tr("Stats"),self)
+        # self.stats_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        self.stats_dock.setWidget(self.stats_list_widget)
+        self.stats_dock.setObjectName("aiStatistics")
+        
 
         self.flag_dock = self.flag_widget = None
         self.flag_dock = QtWidgets.QDockWidget(self.tr("Flags"), self)
@@ -139,6 +152,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.shape_dock.setObjectName("Labels")
         self.shape_dock.setWidget(self.labelList)
 
+        ## This is the label list widget on the right dock
         self.uniqLabelList = UniqueLabelQListWidget()
         self.uniqLabelList.setToolTip(
             self.tr(
@@ -217,6 +231,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, self.label_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.shape_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.file_dock)
+        ## Adding stats dock here
+        self.addDockWidget(Qt.RightDockWidgetArea, self.stats_dock)
+
 
         # Actions
         action = functools.partial(utils.newAction, self)
@@ -1193,8 +1210,10 @@ class MainWindow(QtWidgets.QMainWindow):
         ipt_img_path = infer(self.openFilename,'img')
         ipt_img_path, patches_dir = create_patches(ipt_img_path)
         label_dir = iel_detection(patches_dir)
-        filename = get_json_from_labels(ipt_img_path,label_dir)
+        clss_cnt, filename = get_json_from_labels(ipt_img_path,label_dir)
         self.display(filename)
+        clss_cnt['QHist'] = round(clss_cnt['Epithelial Nuclei']/clss_cnt['IEL'],3)
+        self.addStats(clss_cnt)
     
 
     def setEditMode(self):
@@ -1320,6 +1339,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.duplicate.setEnabled(n_selected)
         self.actions.copy.setEnabled(n_selected)
         self.actions.edit.setEnabled(n_selected == 1)
+
+    def addStats(self, kdict):
+        for key, value in kdict.items():
+            self.stats_list_widget.addItem(f'{key}: {value}')
+        
 
     def addLabel(self, shape):
         if shape.group_id is None:
