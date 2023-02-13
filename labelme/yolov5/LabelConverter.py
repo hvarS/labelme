@@ -10,13 +10,17 @@ import json
 
 MULTIPLIER = 640
 
+CLASS_MAPPING = {
+    0: 'Epithelial Nuclei',
+    1: 'IEL'
+}
 
 def color(clss, img, x_off, y_off, start_x, start_y, height, width) -> dict:
     clr = [(0,0,255),(0,255,0)]
     
     if clss == 0:
         shape = {}
-        shape['label'] = 'Epithelial Nuclei'
+        shape['label'] = CLASS_MAPPING[clss]
         shape["line_color"] = [
             0,
             128,
@@ -32,7 +36,7 @@ def color(clss, img, x_off, y_off, start_x, start_y, height, width) -> dict:
         shape['points'] = []
     else:
         shape = {}
-        shape['label'] = 'IEL'
+        shape['label'] = CLASS_MAPPING[clss]
         shape["line_color"] = [
             85,
             0,
@@ -77,6 +81,11 @@ def color(clss, img, x_off, y_off, start_x, start_y, height, width) -> dict:
 
 
 def get_json_from_labels(image_file_path:str, labels_path):
+    
+    clss_cnt = {}
+    for clss in CLASS_MAPPING:
+        clss_cnt[CLASS_MAPPING[clss]] = 0
+    
     actual_height = 1920
     actual_width = 1920
 
@@ -149,7 +158,10 @@ def get_json_from_labels(image_file_path:str, labels_path):
             rel_width = round(MULTIPLIER*width)
             rel_height = round(MULTIPLIER*height)
             
+
+                
             if float(confidence_score)>0.3:
+                clss_cnt[CLASS_MAPPING[clss]] += 1
                 shape = color(clss, np_img, grid[idx][0], grid[idx][1],  rel_x_location, rel_y_location, rel_width, rel_height)
                 shapes.append(shape)
 
@@ -160,7 +172,7 @@ def get_json_from_labels(image_file_path:str, labels_path):
     with open('annotations/'+img_name+'_iel.json','w') as f:
         f.write(json_object)
     
-    return os.path.join(os.getcwd(),'annotations/'+img_name+'_iel.json')
+    return clss_cnt, os.path.join(os.getcwd(),'annotations/'+img_name+'_iel.json')
 
 
 
